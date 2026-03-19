@@ -1,0 +1,6 @@
+Builds/
+.vs/
+out/
+*.exe
+*.dll
+*.lib
