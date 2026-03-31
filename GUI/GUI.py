@@ -4,9 +4,9 @@ import xml.etree.ElementTree as ET
 import os
 import json
 import glob
-import copy # ADDED: For deep-copying JSON blocks
+import copy 
 
-# --- DIRECTORY MANAGEMENT ---
+# Hardcoded directory (Change for custom directory. Make sure to change in backend code as well)
 JSON_DIR = r"D:\Guitar Processor data\JSON"
 JUCE_DIR = r"D:\Guitar Processor data\JUCE XML"
 
@@ -14,7 +14,7 @@ os.makedirs(JSON_DIR, exist_ok=True)
 os.makedirs(JUCE_DIR, exist_ok=True)
 os.chdir(JSON_DIR)
 
-# --- INITIAL SETUP ---
+# Starting setup
 osc = udp_client.SimpleUDPClient("127.0.0.1", 7001)
 
 next_node_id = 3
@@ -35,11 +35,11 @@ active_bank_val = 0
 active_preset_val = 0
 currently_selected_preset_str = None
 
-# ADDED: Copy mode states
+
 copy_mode_active = False
 override_initial_preset = None
 
-# --- PIN INFO PARSER ---
+
 plugin_pin_info = {}
 def init_plugin_pin_info():
     plugin_pin_info.clear()
@@ -71,13 +71,11 @@ with dpg.theme() as global_theme:
         dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1, category=dpg.mvThemeCat_Core)
 dpg.bind_theme(global_theme)
 
-# ADDED: Highlight theme for copy button
 with dpg.theme(tag="highlight_text_theme"):
     with dpg.theme_component(dpg.mvMenuItem):
         dpg.add_theme_color(dpg.mvThemeCol_Text, [255, 200, 50])
 
 
-# --- UNIFIED JSON MANAGEMENT ---
 
 def create_empty_setlist(name):
     return {
@@ -159,8 +157,6 @@ def load_unified_setlist(sender, app_data):
     next_node_id = max_id + 1
     refresh_entire_bank_ui()
     
-    # THE FIX: Only force a preset load if we are specifically returning from a "Copy Preset" action.
-    # Otherwise, the UI loads beautifully blank and waits for user input.
     if setlist_data["num_banks"] > 0:
         if override_initial_preset:
             select_preset_callback(None, None, override_initial_preset)
@@ -208,7 +204,7 @@ def delete_list_callback():
         dpg.set_value("new_list_input", "Default")
         create_new_bank_list(None, None)
 
-# --- PLUGIN SCANNER HELPERS ---
+# scanner helper fncts
 
 def scan_plugins_callback():
     osc.send_message("/system/scan", [])
@@ -229,7 +225,7 @@ def populate_plugin_menu():
     init_plugin_pin_info()
 
 
-# --- UI HELPER FUNCTIONS ---
+# helper fncs
 
 def hard_clear_python_ui():
     global next_node_id
@@ -307,7 +303,7 @@ def create_plugin_node_ui(juce_id, plugin_name, preset_str, pos):
     node_positions[dpg_node_id] = pos
 
 
-# --- CORE CALLBACKS ---
+# core callbacks
 
 def add_plugin_callback(sender, app_data, user_data):
     global next_node_id
@@ -385,7 +381,7 @@ def global_remove_callback():
 def save_preset_callback():
     if not currently_selected_preset_str: return
     
-    # --- FIX: Synchronize Python's memory with C++'s latest disk writes ---
+
     global setlist_data
     file_path = os.path.join(JSON_DIR, f"Setlist_{current_setlist_name}.json")
     if os.path.exists(file_path):
@@ -396,7 +392,6 @@ def save_preset_callback():
                     setlist_data["banks"] = disk_data["banks"]
             except:
                 pass
-    # ----------------------------------------------------------------------
     
     nodes_to_save = []
     
@@ -430,9 +425,6 @@ def save_preset_callback():
     
     osc.send_message("/preset/save", [active_bank_val, active_preset_val])
 
-
-# --- ADDED: COPY PRESET MODE ---
-
 def toggle_copy_mode():
     global copy_mode_active
     if not currently_selected_preset_str: return
@@ -449,8 +441,6 @@ def cancel_copy_mode():
     dpg.hide_item("cancel_copy_btn")
 
 
-# --- BROWSER UI & CALLBACKS ---
-
 def select_preset_callback(sender, app_data, user_data):
     global currently_selected_preset_str, active_bank_val, active_preset_val
     global copy_mode_active, next_node_id, override_initial_preset
@@ -458,10 +448,9 @@ def select_preset_callback(sender, app_data, user_data):
     bank_num, preset_num = int(user_data[0]), int(user_data[1])
     internal_preset_str = f"Bank {bank_num} - Preset {preset_num}"
     
-    # --- ADDED: Execute Preset Copy Data Injection ---
     if copy_mode_active:
         if currently_selected_preset_str:
-            save_preset_callback() # Force save current preset to lock VST states
+            save_preset_callback() 
             
             src_b = str(active_bank_val)
             src_p = str(active_preset_val)
@@ -490,12 +479,11 @@ def select_preset_callback(sender, app_data, user_data):
             
             cancel_copy_mode()
             
-            # Tell C++ to ingest the copied JSON to map the new VSTs
             override_initial_preset = (bank_num, preset_num)
             load_unified_setlist(None, current_setlist_name)
             override_initial_preset = None
         return
-    # ------------------------------------------------
+    
 
     preset_name = setlist_data["banks"][str(bank_num)]["presets"][str(preset_num)].get("name", f"PRESET {preset_num}")
     bank_name = setlist_data["banks"][str(bank_num)].get("name", f"BANK {bank_num}")
@@ -575,7 +563,7 @@ def add_bank_callback():
     dpg.focus_item("create_bank_input")
 
 
-# --- BUILD THE UI ---
+# UI
 
 with dpg.window(label="Pedalboard UI", width=1200, height=800, tag="MainWindow"):
     with dpg.menu_bar():
@@ -599,10 +587,9 @@ with dpg.window(label="Pedalboard UI", width=1200, height=800, tag="MainWindow")
         dpg.add_menu_item(label="Remove Selected Wire", callback=global_remove_callback)
         dpg.add_menu_item(label="Save Preset", callback=save_preset_callback)
         
-        # --- ADDED: The Interactive Copy Buttons ---
+        # Copying buttons
         dpg.add_menu_item(label="Save to another preset", tag="copy_preset_btn", callback=toggle_copy_mode)
         dpg.add_menu_item(label="Cancel", tag="cancel_copy_btn", show=False, callback=cancel_copy_mode)
-        # ------------------------------------------
 
         dpg.add_text("No Preset Selected", tag="active_preset_label", color=[150, 255, 150])
         dpg.add_text(" [ UNSAVED ] ", tag="unsaved_indicator", color=[255, 100, 100], show=False)
@@ -653,7 +640,6 @@ dpg.setup_dearpygui()
 dpg.show_viewport()
 dpg.set_primary_window("MainWindow", True)
 
-# Initialize Dynamic Menus
 populate_plugin_menu()
 
 existing_lists = refresh_setlist_dropdown()
