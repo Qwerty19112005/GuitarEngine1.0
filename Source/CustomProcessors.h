@@ -2,9 +2,6 @@
 #include <JuceHeader.h>
 #include <atomic>
 
-// ==============================================================================
-// 2. THE INPUT ROUTER (1 Stereo In -> 4 Stereo Outs)
-// ==============================================================================
 class InputRouterProcessor : public juce::AudioProcessor
 {
 public:

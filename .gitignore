@@ -4,3 +4,8 @@ out/
 *.exe
 *.dll
 *.lib
+
+# Python Ignores
+__pycache__/
+venv/
+.env

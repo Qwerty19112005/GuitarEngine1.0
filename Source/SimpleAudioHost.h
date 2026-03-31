@@ -1,452 +1,659 @@
 #pragma once
 #include <JuceHeader.h>
+#include <tracktion_engine/tracktion_engine.h>
+#include "PluginWindow.h"
+#include <memory>
 #include <map>
 #include <vector>
-#include "PluginWindow.h"
-#include "CustomProcessors.h"
+#include <functional>
+#include <fstream>
 #include "json.hpp"
+
+namespace te = tracktion_engine;
 using json = nlohmann::json;
 
-class SetlistManager
+
+class SimpleAudioHost : public juce::OSCReceiver::Listener<juce::OSCReceiver::MessageLoopCallback>,
+    public juce::Timer
 {
 public:
-    SetlistManager()
-    {
-        juce::File dir("D:\\Guitar Processor data\\Unified_Setlists");
-        if (!dir.exists()) dir.createDirectory();
-        setlistDir = dir;
-    }
+    struct PresetTrack {
+        int bankIndex;
+        int presetIndex;
+        te::AudioTrack::Ptr track;
+        te::VolumeAndPanPlugin* inputFader = nullptr;
+        te::RackType::Ptr rackType;
+        te::Plugin::Ptr rackInstance;
+        te::VolumeAndPanPlugin* outputFader = nullptr;
+    };
 
-    void createNewSetlist(const std::string& name)
-    {
-        currentSetlistName = name;
-        currentData = json::object();
-        currentData["name"] = name;
-        currentData["banks"] = json::object();
-        saveToDisk();
-    }
+    struct NodeLocation {
+        int bankIndex;
+        int presetIndex;
+    };
 
-    bool loadSetlist(const std::string& name)
-    {
-        juce::File file = setlistDir.getChildFile(name + ".json");
-        if (!file.existsAsFile()) return false;
-
-        std::string content = file.loadFileAsString().toStdString();
-        try {
-            currentData = json::parse(content);
-            currentSetlistName = name;
-            return true;
-        }
-        catch (...) {
-            return false;
-        }
-    }
-
-    void saveToDisk()
-    {
-        if (currentSetlistName.empty()) return;
-        juce::File file = setlistDir.getChildFile(currentSetlistName + ".json");
-        file.replaceWithText(currentData.dump(4));
-    }
-
-    json currentData;
-    std::string currentSetlistName;
-
-private:
-    juce::File setlistDir;
-};
-
-
-class SimpleAudioHost : public juce::OSCReceiver,
-    public juce::OSCReceiver::ListenerWithOSCAddress<juce::OSCReceiver::MessageLoopCallback>
-{
-public:
     SimpleAudioHost()
     {
-        mainGraph = std::make_unique<juce::AudioProcessorGraph>();
-        player.setProcessor(mainGraph.get());
+        std::cout << "\n=======================================================" << std::endl;
+        std::cout << "=== V50.5: SETLIST MEGA-GRAPH (ISOLATED SAVE FIX) ====" << std::endl;
+        std::cout << "=======================================================\n" << std::endl;
 
-        deviceManager.setCurrentAudioDeviceType("ASIO", true);
-        juce::String myDeviceName = "AudioBox ASIO Driver";
-        auto error = deviceManager.initialise(2, 2, nullptr, false, myDeviceName, nullptr);
+        engine = std::make_unique<te::Engine>(ProjectInfo::projectName);
+        auto& tracktionDM = engine->getDeviceManager();
+        auto& juceDM = tracktionDM.deviceManager;
 
-        if (error.isEmpty())
-        {
-            deviceManager.addAudioCallback(&player);
-            std::cout << "Audio Interface is live" << std::endl;
+        tracktionDM.initialise(2, 2);
+        juceDM.setCurrentAudioDeviceType("ASIO", true);
 
-            scanForPlugins();
-            setupHardwareNodes();
-
-            if (connect(7001))
-            {
-                std::cout << "OSC Server listening on Port 7001" << std::endl;
-                addListener(this, "/node/add");
-                addListener(this, "/node/connect");
-                addListener(this, "/node/disconnect");
-                addListener(this, "/node/show_ui");
-                addListener(this, "/node/remove");
-                addListener(this, "/preset/switch");
-                addListener(this, "/preset/save");
-                addListener(this, "/preset/restore_state");
-                addListener(this, "/list/clear");
+        juce::AudioIODeviceType* asioType = nullptr;
+        for (auto* type : juceDM.getAvailableDeviceTypes()) {
+            if (type->getTypeName() == "ASIO") {
+                asioType = type;
+                break;
             }
         }
+
+        if (asioType != nullptr) {
+            asioType->scanForDevices();
+            for (const auto& name : asioType->getDeviceNames()) {
+                if (name.containsIgnoreCase("AudioBox") || name.containsIgnoreCase("Audio Box") || name.containsIgnoreCase("PreSonus")) {
+                    juce::AudioDeviceManager::AudioDeviceSetup setup;
+                    juceDM.getAudioDeviceSetup(setup);
+                    setup.inputDeviceName = name;
+                    setup.outputDeviceName = name;
+                    setup.bufferSize = 128;
+                    setup.sampleRate = 44100;
+                    setup.useDefaultInputChannels = false;
+                    setup.useDefaultOutputChannels = false;
+                    setup.inputChannels.setRange(0, 256, true);
+                    setup.outputChannels.setRange(0, 256, true);
+                    juceDM.setAudioDeviceSetup(setup, true);
+                    std::cout << "[ASIO] Interface Locked to: " << name << std::endl;
+                    break;
+                }
+            }
+        }
+
+        tracktionDM.dispatchPendingUpdates();
+        tracktionDM.rescanWaveDeviceList();
+        tracktionDM.enableAllWaveInputs();
+        tracktionDM.enableAllWaveOutputs();
+
+        if (tracktionDM.getNumWaveOutDevices() > 0) {
+            if (auto* outDev = tracktionDM.getWaveOutDevice(0)) {
+                outDev->setStereoPair(true);
+                targetOutputDeviceID = outDev->getName();
+                tracktionDM.setDefaultWaveOutDevice(targetOutputDeviceID);
+            }
+        }
+
+        scanForPlugins();
+
+        if (oscReceiver.connect(7001)) {
+            oscReceiver.addListener(this);
+            std::cout << "[OSC] SUCCESS: Listening on Port 7001..." << std::endl;
+        }
+
+        te::Edit::Options options{ *engine, te::createEmptyEdit(*engine) };
+        currentEdit = std::make_unique<te::Edit>(options);
+        if (auto* firstTrack = te::getAudioTracks(*currentEdit)[0]) currentEdit->deleteTrack(firstTrack);
+        currentEdit->getTransport().ensureContextAllocated();
+        currentEdit->getTransport().play(true);
+
+        startTimer(15);
     }
 
-    ~SimpleAudioHost()
+    ~SimpleAudioHost() override
     {
-        disconnect();
-        deviceManager.removeAudioCallback(&player);
-        player.setProcessor(nullptr);
+        stopTimer();
+        oscReceiver.disconnect();
+        activeWindows.clear();
+        currentEdit.reset();
+        engine.reset();
+    }
+
+    int getSafeInt(const juce::OSCMessage& msg, int index) {
+        if (index >= msg.size()) return 0;
+        if (msg[index].isInt32()) return msg[index].getInt32();
+        if (msg[index].isFloat32()) return static_cast<int>(msg[index].getFloat32());
+        if (msg[index].isString()) return msg[index].getString().getIntValue();
+        return 0;
+    }
+
+    juce::String getSafeString(const juce::OSCMessage& msg, int index) {
+        if (index >= msg.size()) return "";
+        if (msg[index].isString()) return msg[index].getString();
+        if (msg[index].isInt32()) return juce::String(msg[index].getInt32());
+        return "";
     }
 
     void clearMegaGraph()
     {
-        std::cout << "=== EXECUTING HARD MEMORY CLEAR ===" << std::endl;
+        std::cout << "\n[MEM_CHECK] Purging Mega-Graph..." << std::endl;
+        activeWindows.clear();
+        activePlugins.clear();
+        activeBanks.clear();
+        nodeToLocationMap.clear();
 
-        std::vector<int> nodesToDestroy;
-        for (const auto& pair : activeNodes) {
-            int id = pair.first;
-            if (id != 1 && id != 2 && id != 1000 && id != 1001) {
-                nodesToDestroy.push_back(id);
+        currentActiveBank = 0;
+        currentActivePreset = 0;
+        pendingRoutingId++;
+
+        te::Edit::Options options{ *engine, te::createEmptyEdit(*engine) };
+        currentEdit = std::make_unique<te::Edit>(options);
+        if (auto* firstTrack = te::getAudioTracks(*currentEdit)[0]) currentEdit->deleteTrack(firstTrack);
+
+        currentEdit->getTransport().ensureContextAllocated();
+        currentEdit->getTransport().play(true);
+        std::cout << "[SYSTEM] Engine is empty and ready." << std::endl;
+    }
+
+    void ensureBankExists(int bankIndex)
+    {
+        if (activeBanks.count(bankIndex)) return;
+
+        std::cout << "[SYSTEM] Spawning 4-Track Block for Bank " << bankIndex << "..." << std::endl;
+
+        for (int presetIndex = 1; presetIndex <= 4; ++presetIndex) {
+            PresetTrack pt;
+            pt.bankIndex = bankIndex;
+            pt.presetIndex = presetIndex;
+
+            pt.track = currentEdit->insertNewAudioTrack(te::TrackInsertPoint(nullptr, nullptr), nullptr);
+            pt.track->setName("Bank_" + juce::String(bankIndex) + "_Preset_" + juce::String(presetIndex));
+            if (targetOutputDeviceID.isNotEmpty()) pt.track->getOutput().setOutputToDeviceID(targetOutputDeviceID);
+
+            if (auto vol = currentEdit->getPluginCache().createNewPlugin(te::VolumeAndPanPlugin::xmlTypeName, juce::PluginDescription())) {
+                pt.inputFader = dynamic_cast<te::VolumeAndPanPlugin*>(vol.get());
+                pt.inputFader->setVolumeDb(-100.0f);
+                pt.track->pluginList.insertPlugin(vol, 0, nullptr);
+            }
+
+            pt.rackType = currentEdit->getRackList().addNewRack();
+            pt.rackType->rackName = "Rack_B" + juce::String(bankIndex) + "_P" + juce::String(presetIndex);
+
+            auto rackInstanceInfo = te::RackInstance::create(*pt.rackType);
+            if (auto rackInst = currentEdit->getPluginCache().createNewPlugin(rackInstanceInfo)) {
+                pt.rackInstance = rackInst;
+                pt.track->pluginList.insertPlugin(rackInst, 1, nullptr);
+            }
+
+            if (auto volOut = currentEdit->getPluginCache().createNewPlugin(te::VolumeAndPanPlugin::xmlTypeName, juce::PluginDescription())) {
+                pt.outputFader = dynamic_cast<te::VolumeAndPanPlugin*>(volOut.get());
+                pt.outputFader->setVolumeDb(0.0f);
+                pt.track->pluginList.insertPlugin(volOut, 2, nullptr);
+            }
+
+            activeBanks[bankIndex][presetIndex] = std::move(pt);
+        }
+    }
+
+    void applyCurrentRouting(bool isBankSwitch)
+    {
+        int myRoutingId = ++pendingRoutingId;
+
+        for (auto& bankPair : activeBanks) {
+            for (auto& presetPair : bankPair.second) {
+                if (auto fader = presetPair.second.inputFader) fader->setVolumeDb(-100.0f);
+                if (isBankSwitch) {
+                    if (auto fader = presetPair.second.outputFader) fader->setVolumeDb(-100.0f);
+                }
             }
         }
 
-        for (int id : nodesToDestroy) {
-            if (activeWindows.find(id) != activeWindows.end()) {
-                activeWindows.erase(id);
+        if (isBankSwitch) {
+            juce::Timer::callAfterDelay(10, [this, myRoutingId]() {
+                juce::ScopedLock sl(queueLock);
+                taskQueue.push_back([this, myRoutingId]() {
+                    if (myRoutingId != pendingRoutingId) return;
+
+                    for (auto& pair : activePlugins) {
+                        int nId = pair.first;
+                        if (nodeToLocationMap.count(nId)) {
+                            int bId = nodeToLocationMap[nId].bankIndex;
+                            bool isActiveBank = (bId == currentActiveBank);
+                            if (pair.second != nullptr) {
+                                pair.second->setEnabled(isActiveBank);
+                            }
+                        }
+                    }
+
+                    juce::Timer::callAfterDelay(10, [this, myRoutingId]() {
+                        juce::ScopedLock sl2(queueLock);
+                        taskQueue.push_back([this, myRoutingId]() {
+                            if (myRoutingId != pendingRoutingId) return;
+
+                            for (auto& bankPair : activeBanks) {
+                                int bId = bankPair.first;
+                                for (auto& presetPair : bankPair.second) {
+                                    int pId = presetPair.first;
+
+                                    if (auto fader = presetPair.second.outputFader) fader->setVolumeDb(0.0f);
+
+                                    if (bId == currentActiveBank && pId == currentActivePreset) {
+                                        if (auto fader = presetPair.second.inputFader) fader->setVolumeDb(0.0f);
+                                    }
+                                }
+                            }
+                            });
+                        });
+                    });
+                });
+        }
+        else {
+            if (activeBanks.count(currentActiveBank) && activeBanks[currentActiveBank].count(currentActivePreset)) {
+                if (auto fader = activeBanks[currentActiveBank][currentActivePreset].inputFader) {
+                    fader->setVolumeDb(0.0f);
+                }
             }
-            mainGraph->removeNode(activeNodes[id].get());
-            activeNodes.erase(id);
+        }
+    }
+
+    void forceScanNewPlugins()
+    {
+        std::cout << "\n[SYSTEM] Scanning default VST3 folders for new plugins... Please wait." << std::endl;
+        if (formatManager.getNumFormats() == 0) return;
+
+        juce::AudioPluginFormat* format = formatManager.getFormat(0);
+        juce::FileSearchPath paths = format->getDefaultLocationsToSearch();
+        juce::PluginDirectoryScanner scanner(pluginList, *format, paths, true, juce::File());
+
+        juce::String pluginName;
+        while (scanner.scanNextFile(true, pluginName)) {
+            std::cout << "   -> Found: " << pluginName << std::endl;
         }
 
-        presetNodeMap.clear();
-        std::cout << "Bank Memory Cleared. Awaiting new routing instructions." << std::endl;
+        juce::File cacheFile("D:\\Guitar Processor data\\JUCE XML\\PluginCache.xml");
+
+        if (auto xml = pluginList.createXml()) {
+            xml->writeTo(cacheFile);
+            engine->getPluginManager().knownPluginList.recreateFromXml(*xml);
+        }
+
+        std::cout << "[SYSTEM] Plugin scan complete. Cache updated successfully.\n" << std::endl;
     }
 
     void oscMessageReceived(const juce::OSCMessage& message) override
     {
-        if (message.getAddressPattern() == "/node/add" && message.size() >= 3)
-        {
-            int nodeId = message[0].getInt32();
-            juce::String pluginName = message[1].getString();
-            int presetIndex = message[2].getInt32() - 1;
+        juce::String pattern = message.getAddressPattern().toString();
 
-            juce::String listName = "";
-            int bank = 0;
-            if (message.size() == 5) {
-                listName = message[3].getString();
-                bank = message[4].getInt32();
-            }
-
-            loadPluginWithID(nodeId, pluginName, presetIndex, listName, bank);
+        if (pattern == "/system/scan") {
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this]() {
+                forceScanNewPlugins();
+                });
         }
+        else if (pattern == "/setlist/load" && message.size() >= 1) {
+            juce::String setName = getSafeString(message, 0);
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, setName]() {
 
-        else if (message.getAddressPattern() == "/list/clear")
-        {
-            clearMegaGraph();
-            currentBank = -1;
-        }
-
-
-        // PRESET SWITCH
-        else if (message.getAddressPattern() == "/preset/switch" && message.size() == 2)
-        {
-            int bank = message[0].isInt32() ? message[0].getInt32() : 1;
-            int targetPreset = (message[1].isInt32() ? message[1].getInt32() : 1) - 1;
-
-            if (bank != currentBank) {
+                systemLocked = true;
                 clearMegaGraph();
-                currentBank = bank;
-            }
+                currentSetName = setName;
 
-            currentActivePreset = targetPreset;
-            std::cout << "JUCE Router switched to -> Bank " << bank << ", Preset Index " << targetPreset << std::endl;
-
-            // Switch the guitar input to the new preset
-            if (activeNodes.find(1000) != activeNodes.end() && activeNodes[1000] != nullptr) {
-                if (auto* r = dynamic_cast<InputRouterProcessor*>(activeNodes[1000]->getProcessor()))
-                    r->setActivePreset(targetPreset);
-            }
-
-            // Wake up the new plugins
-            for (int nodeId : presetNodeMap[targetPreset]) {
-                if (activeNodes.find(nodeId) != activeNodes.end()) {
-                    activeNodes[nodeId]->setBypassed(false);
-                }
-            }
-
-            // Trigger 2 second crossover timer for the old plugins
-          
-            int spilloverTimeMs = 2000;
-            juce::Timer::callAfterDelay(spilloverTimeMs, [this]() {
-                for (const auto& [presetIdx, nodeList] : presetNodeMap) {
-                    if (presetIdx != currentActivePreset) {
-                        for (int nodeId : nodeList) {
-                            if (activeNodes.find(nodeId) != activeNodes.end()) {
-                                activeNodes[nodeId]->setBypassed(true);
-                            }
-                        }
-                    }
-                }
-                });
-        }
-
-        else if (message.getAddressPattern() == "/preset/save" && message.size() == 3)
-        {
-            juce::String listName = message[0].getString();
-            int bank = message[1].getInt32();
-            int preset = message[2].getInt32();
-            int presetIndex = preset - 1;
-
-            std::string listStr = listName.toStdString();
-            std::string bKey = std::to_string(bank);
-            std::string pKey = std::to_string(preset);
-
-            try {
-                if (setlistManager.currentSetlistName != listStr) {
-                    if (!setlistManager.loadSetlist(listStr)) {
-                        setlistManager.createNewSetlist(listStr);
-                    }
+                juce::File jsonFile("D:\\Guitar Processor data\\JSON\\Setlist_" + setName + ".json");
+                if (!jsonFile.existsAsFile()) {
+                    std::cout << "[ERROR] JSON File not found: " << jsonFile.getFullPathName() << std::endl;
+                    systemLocked = false;
+                    return;
                 }
 
-                if (!setlistManager.currentData["banks"].is_object()) {
-                    setlistManager.currentData["banks"] = json::object();
-                }
-
-                json& banksJson = setlistManager.currentData["banks"];
-                if (!banksJson.contains(bKey)) banksJson[bKey] = json::object();
-
-                json& bankObj = banksJson[bKey];
-                if (!bankObj.contains("presets")) bankObj["presets"] = json::object();
-
-                json& presetsJson = bankObj["presets"];
-                if (!presetsJson.contains(pKey)) presetsJson[pKey] = json::object();
-
-                json& presetObj = presetsJson[pKey];
-                presetObj["nodes"] = json::array();
-                json& nodesJson = presetObj["nodes"];
-
-                presetObj["links"] = json::array();
-                json& linksJson = presetObj["links"];
-
-                if (presetNodeMap.find(presetIndex) != presetNodeMap.end())
-                {
-                    for (int nodeId : presetNodeMap[presetIndex])
-                    {
-                        if (activeNodes.find(nodeId) != activeNodes.end())
-                        {
-                            auto* processor = activeNodes[nodeId]->getProcessor();
-                            if (processor != nullptr)
-                            {
-                                juce::MemoryBlock stateBlock;
-                                processor->getStateInformation(stateBlock);
-
-                                json nodeObj;
-                                nodeObj["id"] = nodeId;
-                                nodeObj["name"] = processor->getName().toStdString();
-                                nodeObj["state"] = stateBlock.toBase64Encoding().toStdString();
-                                nodesJson.push_back(nodeObj);
-                            }
-                        }
-                    }
-                }
-
-                for (auto connection : mainGraph->getConnections()) {
-                    int srcNode = connection.source.nodeID.uid;
-                    int dstNode = connection.destination.nodeID.uid;
-                    int srcChan = connection.source.channelIndex;
-                    int dstChan = connection.destination.channelIndex;
-
-                    bool belongsToPreset = false;
-                    auto& pNodes = presetNodeMap[presetIndex];
-
-                    if (std::find(pNodes.begin(), pNodes.end(), srcNode) != pNodes.end()) belongsToPreset = true;
-                    if (std::find(pNodes.begin(), pNodes.end(), dstNode) != pNodes.end()) belongsToPreset = true;
-                    if (srcNode == 1000 && (srcChan == presetIndex * 2 || srcChan == presetIndex * 2 + 1)) belongsToPreset = true;
-                    if (dstNode == 1001 && (dstChan == presetIndex * 2 || dstChan == presetIndex * 2 + 1)) belongsToPreset = true;
-
-                    if (belongsToPreset) {
-                        json linkObj;
-                        linkObj["src_node"] = srcNode;
-                        linkObj["src_chan"] = srcChan;
-                        linkObj["dst_node"] = dstNode;
-                        linkObj["dst_chan"] = dstChan;
-                        linksJson.push_back(linkObj);
-                    }
-                }
-
-                setlistManager.saveToDisk();
-                std::cout << "SUCCESS: Saved DSP state & Routing to Unified JSON for -> " << listStr << " / Bank " << bKey << " / Preset " << pKey << std::endl;
-
-            }
-            catch (const json::exception& e) {
-                std::cout << "JSON EXCEPTION DURING SAVE: " << e.what() << std::endl;
-            }
-            catch (const std::exception& e) {
-                std::cout << "STANDARD EXCEPTION DURING SAVE: " << e.what() << std::endl;
-            }
-        }
-
-        else if (message.getAddressPattern() == "/node/connect" && message.size() == 5)
-        {
-            int srcNode = message[0].getInt32();
-            int srcChan = message[1].getInt32();
-            int dstNode = message[2].getInt32();
-            int dstChan = message[3].getInt32();
-            int pIndex = message[4].getInt32() - 1;
-
-            if (srcNode == 1) {
-                srcNode = 1000;
-                srcChan = srcChan + (pIndex * 2);
-            }
-            if (dstNode == 2) {
-                dstNode = 1001;
-                dstChan = dstChan + (pIndex * 2);
-            }
-
-            mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(srcNode), srcChan },
-                                       { juce::AudioProcessorGraph::NodeID(dstNode), dstChan } });
-        }
-
-        else if (message.getAddressPattern() == "/node/disconnect" && message.size() == 5)
-        {
-            int srcNode = message[0].getInt32();
-            int srcChan = message[1].getInt32();
-            int dstNode = message[2].getInt32();
-            int dstChan = message[3].getInt32();
-            int pIndex = message[4].getInt32() - 1;
-
-            if (srcNode == 1) {
-                srcNode = 1000;
-                srcChan = srcChan + (pIndex * 2);
-            }
-            if (dstNode == 2) {
-                dstNode = 1001;
-                dstChan = dstChan + (pIndex * 2);
-            }
-
-            mainGraph->removeConnection({ { juce::AudioProcessorGraph::NodeID(srcNode), srcChan },
-                                          { juce::AudioProcessorGraph::NodeID(dstNode), dstChan } });
-        }
-
-        else if (message.getAddressPattern() == "/node/show_ui" && message.size() == 1)
-        {
-            int nodeId = message[0].getInt32();
-            juce::MessageManager::callAsync([this, nodeId]() {
-                if (activeWindows.find(nodeId) != activeWindows.end()) {
-                    activeWindows[nodeId]->setVisible(true);
-                    activeWindows[nodeId]->toFront(true);
-                }
-                });
-        }
-
-        else if (message.getAddressPattern() == "/node/remove" && message.size() == 1)
-        {
-            int nodeId = message[0].getInt32();
-
-            if (activeWindows.find(nodeId) != activeWindows.end()) {
-                activeWindows.erase(nodeId);
-            }
-
-            if (activeNodes.find(nodeId) != activeNodes.end()) {
-                mainGraph->removeNode(activeNodes[nodeId].get());
-                activeNodes.erase(nodeId);
-            }
-        }
-    }
-
-    void setupHardwareNodes()
-    {
-        mainGraph->clear();
-        activeNodes.clear();
-
-        using AudioGraphIO = juce::AudioProcessorGraph::AudioGraphIOProcessor;
-
-        activeNodes[1] = mainGraph->addNode(std::make_unique<AudioGraphIO>(AudioGraphIO::audioInputNode), juce::AudioProcessorGraph::NodeID(1));
-        activeNodes[2] = mainGraph->addNode(std::make_unique<AudioGraphIO>(AudioGraphIO::audioOutputNode), juce::AudioProcessorGraph::NodeID(2));
-
-        activeNodes[1000] = mainGraph->addNode(std::make_unique<InputRouterProcessor>(), juce::AudioProcessorGraph::NodeID(1000));
-        activeNodes[1001] = mainGraph->addNode(std::make_unique<OutputMixerProcessor>(), juce::AudioProcessorGraph::NodeID(1001));
-
-        mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(1), 0 }, { juce::AudioProcessorGraph::NodeID(1000), 0 } });
-        mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(1), 1 }, { juce::AudioProcessorGraph::NodeID(1000), 1 } });
-
-        mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(1001), 0 }, { juce::AudioProcessorGraph::NodeID(2), 0 } });
-        mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(1001), 1 }, { juce::AudioProcessorGraph::NodeID(2), 1 } });
-    }
-
-    void loadPluginWithID(int nodeId, const juce::String& pluginName, int presetIndex, juce::String listName, int bank)
-    {
-        std::unique_ptr<juce::PluginDescription> foundDesc;
-        for (auto& desc : pluginList.getTypes())
-        {
-            if (desc.name == pluginName) { foundDesc = std::make_unique<juce::PluginDescription>(desc); break; }
-        }
-
-        if (foundDesc == nullptr) return;
-
-        juce::String errorMsg;
-        auto instance = formatManager.createPluginInstance(*foundDesc, 48000, 128, errorMsg);
-
-        if (instance != nullptr)
-        {
-            auto pluginNode = mainGraph->addNode(std::move(instance), juce::AudioProcessorGraph::NodeID(nodeId));
-            activeNodes[nodeId] = pluginNode;
-            presetNodeMap[presetIndex].push_back(nodeId);
-
-            // Bypass upon loading if it's not the active preset
-            if (presetIndex != currentActivePreset) {
-                pluginNode->setBypassed(true);
-            }
-
-            activeWindows[nodeId] = std::make_unique<PluginWindow>(pluginName, pluginNode->getProcessor());
-            activeWindows[nodeId]->setVisible(false);
-
-            if (listName.isNotEmpty()) {
-                int actualPresetNum = presetIndex + 1;
-                std::string listStr = listName.toStdString();
-                std::string bKey = std::to_string(bank);
-                std::string pKey = std::to_string(actualPresetNum);
-
-                if (setlistManager.currentSetlistName != listStr) {
-                    setlistManager.loadSetlist(listStr);
-                }
-
+                std::string content = jsonFile.loadFileAsString().toStdString();
                 try {
-                    if (setlistManager.currentData.contains("banks") &&
-                        setlistManager.currentData["banks"].contains(bKey) &&
-                        setlistManager.currentData["banks"][bKey].contains("presets") &&
-                        setlistManager.currentData["banks"][bKey]["presets"].contains(pKey) &&
-                        setlistManager.currentData["banks"][bKey]["presets"][pKey].contains("nodes"))
-                    {
-                        json& nodesJson = setlistManager.currentData["banks"][bKey]["presets"][pKey]["nodes"];
+                    json data = json::parse(content);
+                    std::cout << "[SYSTEM] Compiling Setlist Mega-Graph: " << setName << std::endl;
+
+                    if (!data.contains("banks")) { systemLocked = false; return; }
+
+                    for (auto& [bKey, bVal] : data["banks"].items()) {
+                        int bankIdx = std::stoi(bKey);
+                        ensureBankExists(bankIdx);
+
+                        if (!bVal.contains("presets")) continue;
+
+                        for (auto& [pKey, pVal] : bVal["presets"].items()) {
+                            int presetIdx = std::stoi(pKey);
+
+                            if (pVal.contains("nodes")) {
+                                for (auto& n : pVal["nodes"]) {
+                                    int nId = n["id"].get<int>();
+                                    std::string pName = n["name"].get<std::string>();
+                                    std::string b64State = n.contains("state") ? n["state"].get<std::string>() : "";
+
+                                    std::unique_ptr<juce::PluginDescription> desc = nullptr;
+                                    for (const auto& type : pluginList.getTypes()) {
+                                        if (type.name.containsIgnoreCase(pName)) {
+                                            desc = std::make_unique<juce::PluginDescription>(type);
+                                            break;
+                                        }
+                                    }
+
+                                    if (desc != nullptr) {
+                                        juce::ValueTree pluginTree = te::ExternalPlugin::create(*engine, *desc);
+
+                                        if (!b64State.empty()) {
+                                            juce::String cleanB64 = juce::String(b64State).removeCharacters("\r\n\t ");
+                                            if (cleanB64.isNotEmpty()) {
+                                                pluginTree.setProperty(juce::Identifier("state"), cleanB64, nullptr);
+                                            }
+                                        }
+
+                                        if (auto newPlugin = currentEdit->getPluginCache().getOrCreatePluginFor(pluginTree)) {
+
+                                            newPlugin->setEnabled(bankIdx == currentActiveBank);
+                                            activeBanks[bankIdx][presetIdx].rackType->addPlugin(newPlugin, { 0.5f, 0.5f }, false);
+                                            activePlugins[nId] = newPlugin;
+                                            nodeToLocationMap[nId] = { bankIdx, presetIdx };
+
+                                            std::cout << "   -> Loaded Node " << nId << " (" << pName << ") [PRE-INJECTED SYNC]" << std::endl;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (pVal.contains("links")) {
+                                for (auto& l : pVal["links"]) {
+                                    int srcN = l["src_node"].get<int>();
+                                    int rawSrcC = l["src_chan"].get<int>();
+                                    int srcC = rawSrcC + 1;
+                                    int dstN = l["dst_node"].get<int>();
+                                    int rawDstC = l["dst_chan"].get<int>();
+                                    int dstC = rawDstC + 1;
+
+                                    auto& rack = activeBanks[bankIdx][presetIdx].rackType;
+
+                                    if (srcN == 1) {
+                                        auto& trackDM = engine->getDeviceManager();
+                                        if (auto* waveIn = trackDM.getWaveInDevice(rawSrcC)) {
+                                            waveIn->setStereoPair(false);
+                                            if (auto* instance = currentEdit->getCurrentInstanceForInputDevice(waveIn)) {
+                                                instance->setTarget(activeBanks[bankIdx][presetIdx].track->itemID, false, nullptr, 0);
+                                                instance->setRecordingEnabled(activeBanks[bankIdx][presetIdx].track->itemID, true);
+                                                instance->getInputDevice().setMonitorMode(te::InputDevice::MonitorMode::on);
+                                            }
+                                        }
+                                        if (activePlugins.count(dstN)) rack->addConnection(te::EditItemID{}, srcC, activePlugins[dstN]->itemID, dstC);
+                                        std::cout << "   -> Restored Link: HW Audio (Pin " << srcC << ") -> Node " << dstN << " (Pin " << dstC << ")" << std::endl;
+                                    }
+                                    else if (dstN == 2) {
+                                        if (activePlugins.count(srcN)) rack->addConnection(activePlugins[srcN]->itemID, srcC, te::EditItemID{}, dstC);
+                                        std::cout << "   -> Restored Link: Node " << srcN << " (Pin " << srcC << ") -> Speaker Output (Pin " << dstC << ")" << std::endl;
+                                    }
+                                    else {
+                                        if (activePlugins.count(srcN) && activePlugins.count(dstN)) {
+                                            rack->addConnection(activePlugins[srcN]->itemID, srcC, activePlugins[dstN]->itemID, dstC);
+                                            std::cout << "   -> Restored Link: Node " << srcN << " -> Node " << dstN << std::endl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    std::cout << "[SYSTEM] Mega-Graph fully assembled. Booting Audio Engine..." << std::endl;
+                    if (currentEdit) currentEdit->restartPlayback();
+                    systemLocked = false;
+                    applyCurrentRouting(true);
+
+                }
+                catch (...) {
+                    std::cout << "[ERROR] Failed to parse Setlist JSON!" << std::endl;
+                    systemLocked = false;
+                }
+                });
+        }
+        else if (pattern == "/preset/switch" && message.size() >= 2) {
+            int targetBank = getSafeInt(message, 0);
+            int targetPreset = getSafeInt(message, 1);
+
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, targetBank, targetPreset]() {
+
+                if (systemLocked) {
+                    std::cout << "[WARN] Preset switch ignored. System is currently locked for boot sequence." << std::endl;
+                    return;
+                }
+
+                std::cout << "[SPILLOVER] Routing Mega-Graph -> Bank " << targetBank << " / Preset " << targetPreset << std::endl;
+
+                bool isBankSwitch = (currentActiveBank != targetBank);
+                currentActiveBank = targetBank;
+                currentActivePreset = targetPreset;
+
+                ensureBankExists(targetBank);
+                applyCurrentRouting(isBankSwitch);
+                });
+        }
+        else if (pattern == "/preset/save" && message.size() >= 2) {
+            int targetBank = getSafeInt(message, 0);
+            int targetPreset = getSafeInt(message, 1);
+
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, targetBank, targetPreset]() {
+                std::cout << "[SAVE] Extracting VST States for Bank " << targetBank << " / Preset " << targetPreset << "..." << std::endl;
+
+                juce::File jsonFile("D:\\Guitar Processor data\\JSON\\Setlist_" + currentSetName + ".json");
+                if (!jsonFile.existsAsFile()) return;
+
+                std::string content = jsonFile.loadFileAsString().toStdString();
+                try {
+                    json data = json::parse(content);
+                    std::string bKey = std::to_string(targetBank);
+                    std::string pKey = std::to_string(targetPreset);
+
+                    if (data["banks"].contains(bKey) && data["banks"][bKey]["presets"].contains(pKey)) {
+                        auto& nodesJson = data["banks"][bKey]["presets"][pKey]["nodes"];
 
                         for (auto& n : nodesJson) {
-                            if (n["id"].get<int>() == nodeId) {
-                                std::string base64State = n["state"].get<std::string>();
+                            int nId = n["id"].get<int>();
+                            if (activePlugins.count(nId)) {
 
-                                juce::String cleanB64(base64State);
-                                cleanB64 = cleanB64.removeCharacters("\r\n\t ");
+                                // --- FIX: STRICT ISOLATED SAVING ---
+                                if (nodeToLocationMap.count(nId) &&
+                                    nodeToLocationMap[nId].bankIndex == targetBank &&
+                                    nodeToLocationMap[nId].presetIndex == targetPreset)
+                                {
+                                    if (auto* ext = dynamic_cast<te::ExternalPlugin*>(activePlugins[nId].get())) {
+                                        ext->flushPluginStateToValueTree();
+                                        juce::String b64State = ext->state.getProperty(juce::Identifier("state"), "").toString();
 
-                                juce::MemoryBlock stateBlock;
-                                if (stateBlock.fromBase64Encoding(cleanB64)) {
-                                    auto* processor = activeNodes[nodeId]->getProcessor();
-                                    processor->suspendProcessing(true);
-                                    processor->setStateInformation(stateBlock.getData(), (int)stateBlock.getSize());
-                                    processor->suspendProcessing(false);
-                                    std::cout << "SUCCESS: VST3 State Injected from Unified JSON for Node " << nodeId << std::endl;
+                                        if (b64State.isNotEmpty()) {
+                                            n["state"] = b64State.toStdString();
+                                        }
+                                    }
                                 }
-                                else {
-                                    std::cout << "ERROR: JSON Base64 Decode Failed for Node " << nodeId << std::endl;
-                                }
+                                // -----------------------------------
+                            }
+                        }
+
+                        jsonFile.replaceWithText(data.dump(4));
+                        std::cout << "[SAVE SUCCESS] Tracktion ValueTree states safely locked to JSON." << std::endl;
+                    }
+                }
+                catch (...) { std::cout << "[ERROR] JSON write failed during Save!" << std::endl; }
+                });
+        }
+        else if (pattern == "/node/add" && message.size() >= 4) {
+            int nodeId = getSafeInt(message, 0);
+            juce::String pluginName = getSafeString(message, 1);
+            int presetIndex = getSafeInt(message, 2);
+            int bankIndex = getSafeInt(message, 3);
+
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, nodeId, pluginName, presetIndex, bankIndex]() {
+                std::cout << "[OSC_RX] Received /node/add -> Node " << nodeId << " (" << pluginName << ")" << std::endl;
+
+                ensureBankExists(bankIndex);
+                auto& preset = activeBanks[bankIndex][presetIndex];
+
+                std::unique_ptr<juce::PluginDescription> desc = nullptr;
+                for (const auto& type : pluginList.getTypes()) {
+                    if (type.name.containsIgnoreCase(pluginName)) {
+                        desc = std::make_unique<juce::PluginDescription>(type);
+                        break;
+                    }
+                }
+
+                if (desc != nullptr) {
+                    juce::ValueTree pluginTree = te::ExternalPlugin::create(*engine, *desc);
+
+                    if (auto newPlugin = currentEdit->getPluginCache().getOrCreatePluginFor(pluginTree)) {
+                        newPlugin->setEnabled(bankIndex == currentActiveBank);
+                        preset.rackType->addPlugin(newPlugin, { 0.5f, 0.5f }, false);
+                        activePlugins[nodeId] = newPlugin;
+                        nodeToLocationMap[nodeId] = { bankIndex, presetIndex };
+                        std::cout << "[RACK_MGR] Instantiated VST in active RAM." << std::endl;
+
+                        if (currentEdit) currentEdit->restartPlayback();
+                    }
+                }
+                else {
+                    std::cout << "[ERROR] Plugin " << pluginName << " not found in Cache." << std::endl;
+                }
+                });
+        }
+        else if (pattern == "/node/remove" && message.size() >= 1) {
+            int nodeId = getSafeInt(message, 0);
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, nodeId]() {
+                std::cout << "[OSC_RX] Received /node/remove -> Node " << nodeId << std::endl;
+
+                if (activePlugins.count(nodeId)) {
+                    if (activeWindows.count(nodeId)) activeWindows.erase(nodeId);
+                    activePlugins[nodeId]->removeFromParent();
+                    activePlugins.erase(nodeId);
+                    nodeToLocationMap.erase(nodeId);
+                    std::cout << "[RACK_MGR] Destroyed Node " << nodeId << " & closed Window." << std::endl;
+
+                    if (currentEdit) currentEdit->restartPlayback();
+                }
+                });
+        }
+        else if (pattern == "/node/show_ui" && message.size() >= 1) {
+            int nodeId = getSafeInt(message, 0);
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, nodeId]() {
+                std::cout << "[OSC_RX] Received /node/show_ui -> Node " << nodeId << std::endl;
+
+                if (activePlugins.count(nodeId)) {
+                    if (!activeWindows.count(nodeId)) {
+                        if (auto* ext = dynamic_cast<te::ExternalPlugin*>(activePlugins[nodeId].get())) {
+                            if (auto* processor = ext->getAudioPluginInstance()) {
+                                activeWindows[nodeId] = std::make_unique<PluginWindow>(processor, activePlugins[nodeId]->getName());
                             }
                         }
                     }
+                    if (activeWindows.count(nodeId)) {
+                        activeWindows[nodeId]->setAlwaysOnTop(true);
+                        activeWindows[nodeId]->setVisible(true);
+                        activeWindows[nodeId]->toFront(true);
+                    }
                 }
-                catch (const std::exception& e) {
-                    std::cout << "JSON Parse Error during auto-restore: " << e.what() << std::endl;
+                });
+        }
+        else if (pattern == "/node/connect" && message.size() >= 4) {
+            int srcNode = getSafeInt(message, 0);
+            int rawSrcChan = getSafeInt(message, 1);
+            int srcChanRack = rawSrcChan + 1;
+            int dstNode = getSafeInt(message, 2);
+            int rawDstChan = getSafeInt(message, 3);
+            int dstChanRack = rawDstChan + 1;
+
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, srcNode, rawSrcChan, srcChanRack, dstNode, rawDstChan, dstChanRack]() {
+                std::cout << "[OSC_RX] Received /node/connect -> Node " << srcNode << " to Node " << dstNode << std::endl;
+
+                int tb = -1, tp = -1;
+                if (srcNode != 1 && nodeToLocationMap.count(srcNode)) { tb = nodeToLocationMap[srcNode].bankIndex; tp = nodeToLocationMap[srcNode].presetIndex; }
+                else if (dstNode != 2 && nodeToLocationMap.count(dstNode)) { tb = nodeToLocationMap[dstNode].bankIndex; tp = nodeToLocationMap[dstNode].presetIndex; }
+                if (tb == -1 || tp == -1 || !activeBanks.count(tb) || !activeBanks[tb].count(tp)) return;
+
+                auto& rack = activeBanks[tb][tp].rackType;
+
+                if (srcNode == 1) {
+                    auto& trackDM = engine->getDeviceManager();
+                    if (auto* waveIn = trackDM.getWaveInDevice(rawSrcChan)) {
+                        waveIn->setStereoPair(false);
+                        if (auto* instance = currentEdit->getCurrentInstanceForInputDevice(waveIn)) {
+                            instance->setTarget(activeBanks[tb][tp].track->itemID, false, nullptr, 0);
+                            instance->setRecordingEnabled(activeBanks[tb][tp].track->itemID, true);
+                            instance->getInputDevice().setMonitorMode(te::InputDevice::MonitorMode::on);
+                        }
+                    }
+                    rack->addConnection(te::EditItemID{}, srcChanRack, activePlugins[dstNode]->itemID, dstChanRack);
+                    std::cout << "   -> Wired: Hardware Audio (Pin " << srcChanRack << ") -> Node " << dstNode << std::endl;
+                }
+                else if (dstNode == 2) {
+                    rack->addConnection(activePlugins[srcNode]->itemID, srcChanRack, te::EditItemID{}, dstChanRack);
+                    std::cout << "   -> Wired: Node " << srcNode << " -> Speaker Output (Pin " << dstChanRack << ")" << std::endl;
+                }
+                else {
+                    rack->addConnection(activePlugins[srcNode]->itemID, srcChanRack, activePlugins[dstNode]->itemID, dstChanRack);
+                    std::cout << "   -> Wired: Node " << srcNode << " -> Node " << dstNode << std::endl;
+                }
+
+                if (currentEdit) currentEdit->restartPlayback();
+                });
+        }
+        else if (pattern == "/node/disconnect" && message.size() >= 4) {
+            int srcNode = getSafeInt(message, 0);
+            int rawSrcChan = getSafeInt(message, 1);
+            int srcChanRack = rawSrcChan + 1;
+            int dstNode = getSafeInt(message, 2);
+            int rawDstChan = getSafeInt(message, 3);
+            int dstChanRack = rawDstChan + 1;
+
+            juce::ScopedLock sl(queueLock);
+            taskQueue.push_back([this, srcNode, srcChanRack, dstNode, dstChanRack]() {
+                std::cout << "[OSC_RX] Received /node/disconnect -> Node " << srcNode << " -X- Node " << dstNode << std::endl;
+
+                int tb = -1, tp = -1;
+                if (srcNode != 1 && nodeToLocationMap.count(srcNode)) { tb = nodeToLocationMap[srcNode].bankIndex; tp = nodeToLocationMap[srcNode].presetIndex; }
+                else if (dstNode != 2 && nodeToLocationMap.count(dstNode)) { tb = nodeToLocationMap[dstNode].bankIndex; tp = nodeToLocationMap[dstNode].presetIndex; }
+                if (tb == -1 || tp == -1 || !activeBanks.count(tb) || !activeBanks[tb].count(tp)) return;
+
+                auto& rack = activeBanks[tb][tp].rackType;
+
+                if (srcNode == 1) rack->removeConnection(te::EditItemID{}, srcChanRack, activePlugins[dstNode]->itemID, dstChanRack);
+                else if (dstNode == 2) rack->removeConnection(activePlugins[srcNode]->itemID, srcChanRack, te::EditItemID{}, dstChanRack);
+                else rack->removeConnection(activePlugins[srcNode]->itemID, srcChanRack, activePlugins[dstNode]->itemID, dstChanRack);
+
+                std::cout << "   -> Connection Severed." << std::endl;
+
+                if (currentEdit) currentEdit->restartPlayback();
+                });
+        }
+    }
+
+    void timerCallback() override
+    {
+        int tasksProcessed = 0;
+
+        while (tasksProcessed < 15) {
+            std::function<void()> task = nullptr;
+            {
+                juce::ScopedLock sl(queueLock);
+                if (taskQueue.empty()) break;
+                task = taskQueue.front();
+                taskQueue.erase(taskQueue.begin());
+            }
+            if (task != nullptr) {
+                task();
+                tasksProcessed++;
+            }
+        }
+
+        static int diagCounter = 0;
+        if (++diagCounter >= 100) {
+            diagCounter = 0;
+            if (engine != nullptr) {
+                double cpuLoad = engine->getDeviceManager().deviceManager.getCpuUsage() * 100.0;
+                if (currentActiveBank == 0 || systemLocked) {
+                    std::cout << "[DIAGNOSTIC] CPU: " << juce::String(cpuLoad, 1) << "% | STATUS: BOOTING / STANDBY" << std::endl;
+                }
+                else {
+                    std::cout << "[DIAGNOSTIC] CPU: " << juce::String(cpuLoad, 1) << "% | Active Bank: " << currentActiveBank << " | Presets Loaded: " << activeBanks.size() * 4 << std::endl;
                 }
             }
         }
@@ -455,120 +662,35 @@ public:
     void scanForPlugins()
     {
         formatManager.addFormat(new juce::VST3PluginFormat());
-
-        juce::File cacheFile = getJuceXmlDirectory().getChildFile("PluginCache.xml");
-
-        if (cacheFile.existsAsFile())
-        {
-            std::unique_ptr<juce::XmlElement> xml = juce::XmlDocument::parse(cacheFile);
-            if (xml != nullptr) { pluginList.recreateFromXml(*xml); return; }
-        }
-
-        std::cout << "No PluginCache.xml found in D: drive. Starting full VST3 deep scan..." << std::endl;
-        std::cout << "Please wait, this may take a few minutes if you have heavy plugins..." << std::endl;
-
-        juce::File vst3Folder("C:\\Program Files\\Common Files\\VST3");
-        if (vst3Folder.exists() && formatManager.getFormat(0) != nullptr)
-        {
-            juce::FileSearchPath searchPath(vst3Folder.getFullPathName());
-            juce::PluginDirectoryScanner scanner(pluginList, *formatManager.getFormat(0), searchPath, true, juce::File(), true);
-            juce::String name;
-
-            while (scanner.scanNextFile(true, name)) {
-                std::cout << "Registered: " << name << std::endl;
-            }
-
-            if (auto xml = pluginList.createXml()) {
-                xml->writeTo(cacheFile);
-                std::cout << "--- PLUGIN SCAN COMPLETE. Cache saved to D: Drive! ---" << std::endl;
+        juce::File cacheFile("D:\\Guitar Processor data\\JUCE XML\\PluginCache.xml");
+        if (cacheFile.existsAsFile()) {
+            if (auto xml = juce::XmlDocument::parse(cacheFile)) {
+                pluginList.recreateFromXml(*xml);
+                engine->getPluginManager().knownPluginList.recreateFromXml(*xml);
             }
         }
     }
-
-    void loadBankNative(const std::string& setlistName, int targetBank)
-    {
-        std::cout << "--- NATIVE LOAD TRIGGERED: " << setlistName << " / Bank " << targetBank << " ---" << std::endl;
-
-        if (!setlistManager.loadSetlist(setlistName)) {
-            std::cout << "ERROR: Could not find setlist JSON." << std::endl;
-            return;
-        }
-
-        std::string bKey = std::to_string(targetBank);
-        if (!setlistManager.currentData["banks"].contains(bKey)) {
-            std::cout << "Bank " << targetBank << " is empty or does not exist." << std::endl;
-            return;
-        }
-
-        clearMegaGraph();
-        currentBank = targetBank;
-
-        json& presetsJson = setlistManager.currentData["banks"][bKey]["presets"];
-
-        for (int p = 1; p <= 4; ++p) {
-            std::string pKey = std::to_string(p);
-            int presetIndex = p - 1;
-
-            if (presetsJson.contains(pKey)) {
-
-                if (presetsJson[pKey].contains("nodes")) {
-                    for (auto& n : presetsJson[pKey]["nodes"]) {
-                        int nodeId = n["id"].get<int>();
-                        std::string pluginName = n["name"].get<std::string>();
-
-                        loadPluginWithID(nodeId, juce::String(pluginName), presetIndex, juce::String(setlistName), targetBank);
-                    }
-                }
-
-                if (presetsJson[pKey].contains("links")) {
-                    for (auto& l : presetsJson[pKey]["links"]) {
-                        int srcId = l["src_node"].get<int>();
-                        int dstId = l["dst_node"].get<int>();
-                        int srcCh = l["src_chan"].get<int>();
-                        int dstCh = l["dst_chan"].get<int>();
-
-                        mainGraph->addConnection({ { juce::AudioProcessorGraph::NodeID(srcId), srcCh },
-                                                   { juce::AudioProcessorGraph::NodeID(dstId), dstCh } });
-                    }
-                }
-            }
-        }
-
-        currentActivePreset = 0;
-        if (auto* r = dynamic_cast<InputRouterProcessor*>(activeNodes[1000]->getProcessor())) r->setActivePreset(0);
-
-        for (const auto& [presetIdx, nodeList] : presetNodeMap) {
-            bool shouldBypass = (presetIdx != 0);
-            for (int nodeId : nodeList) {
-                if (activeNodes.find(nodeId) != activeNodes.end()) activeNodes[nodeId]->setBypassed(shouldBypass);
-            }
-        }
-
-        std::cout << "--- NATIVE BANK LOAD COMPLETE ---" << std::endl;
-    }
-
 
 private:
-    juce::File getJuceXmlDirectory()
-    {
-        juce::File dir("D:\\Guitar Processor data\\JUCE XML");
-        if (!dir.exists()) {
-            dir.createDirectory();
-        }
-        return dir;
-    }
+    std::unique_ptr<te::Engine> engine;
+    std::unique_ptr<te::Edit> currentEdit;
+    juce::String targetOutputDeviceID;
 
-    SetlistManager setlistManager;
-    juce::AudioDeviceManager deviceManager;
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList pluginList;
-    juce::AudioProcessorPlayer player;
-    std::unique_ptr<juce::AudioProcessorGraph> mainGraph;
 
-    std::map<int, juce::AudioProcessorGraph::Node::Ptr> activeNodes;
-    std::map<int, std::unique_ptr<PluginWindow>> activeWindows;
-
-    int currentBank = -1;
+    juce::String currentSetName = "Default";
+    int currentActiveBank = 0;
     int currentActivePreset = 0;
-    std::map<int, std::vector<int>> presetNodeMap;
+    bool systemLocked = false;
+    int pendingRoutingId = 0;
+
+    std::map<int, std::map<int, PresetTrack>> activeBanks;
+    std::map<int, te::Plugin::Ptr> activePlugins;
+    std::map<int, std::unique_ptr<PluginWindow>> activeWindows;
+    std::map<int, NodeLocation> nodeToLocationMap;
+
+    juce::CriticalSection queueLock;
+    std::vector<std::function<void()>> taskQueue;
+    juce::OSCReceiver oscReceiver;
 };
