@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<JUCERPROJECT id="ohfg0G" name="GuitarEngine" projectType="consoleapp" useAppConfig="0"
+<JUCERPROJECT id="ohfg0G" name="GuitarEngine2.0" projectType="consoleapp" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1">
-  <MAINGROUP id="qbNkIL" name="GuitarEngine">
+  <MAINGROUP id="qbNkIL" name="GuitarEngine2.0">
     <GROUP id="{26411779-4AF2-F09B-061A-1601163F40D1}" name="Source">
+      <FILE id="DIiYyb" name="CustomProcessors.h" compile="0" resource="0"
+            file="Source/CustomProcessors.h"/>
+      <FILE id="yTgceU" name="json.hpp" compile="0" resource="0" file="Source/json.hpp"/>
       <FILE id="nhnNkl" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
+      <FILE id="XbbQJi" name="PluginWindow.h" compile="0" resource="0" file="Source/PluginWindow.h"/>
+      <FILE id="o80IL8" name="SimpleAudioHost.h" compile="0" resource="0"
+            file="Source/SimpleAudioHost.h"/>
     </GROUP>
   </MAINGROUP>
   <MODULES>
